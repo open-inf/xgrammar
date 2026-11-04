@@ -23,6 +23,7 @@
 #include "fsm.h"
 #include "grammar_functor.h"
 #include "grammar_impl.h"
+#include "grammar_printer.h"
 #include "support/dynamic_bitset.h"
 #include "support/int_set.h"
 #include "support/logging.h"
@@ -46,7 +47,9 @@ class GrammarMatcherForTokenMaskCache : public EarleyParser {
       const std::unordered_map<int32_t, DynamicBitset>&
           tag_dispatch_rule_id_to_second_slicing_bitset,
       const TokenizerInfo& tokenizer_info,
-      std::optional<RuleLevelCache>& rule_level_cache
+      std::optional<RuleLevelCache>& rule_level_cache,
+      bool may_enter_char_budget,
+      uint64_t exact_budget_cache_key
   )
       : EarleyParser(grammar, init_state),
         init_rule_id_(init_state.rule_id),
@@ -54,7 +57,9 @@ class GrammarMatcherForTokenMaskCache : public EarleyParser {
         tag_dispatch_rule_id_to_second_slicing_bitset_(tag_dispatch_rule_id_to_second_slicing_bitset
         ),
         tokenizer_info_(tokenizer_info),
-        rule_level_cache_(rule_level_cache) {}
+        rule_level_cache_(rule_level_cache),
+        may_enter_char_budget_(may_enter_char_budget),
+        exact_budget_cache_key_(exact_budget_cache_key) {}
   /*!
    * \brief Get the adaptive token mask for the given ParserState.
    * \param is_root_rule Whether to consider the parent rule. If false, there will be
@@ -131,6 +136,11 @@ class GrammarMatcherForTokenMaskCache : public EarleyParser {
   const TokenizerInfo& tokenizer_info_;
 
   std::optional<RuleLevelCache> rule_level_cache_;
+
+  // Context-free masks only need budget-sensitive compilation when this
+  // rule (including referenced rules and lookahead) can enter a budget.
+  bool may_enter_char_budget_;
+  uint64_t exact_budget_cache_key_;
 
   // Temporary data for GetAdaptiveTokenMask.
   std::vector<int32_t> tmp_accepted_indices_;
@@ -523,7 +533,14 @@ bool GrammarMatcherForTokenMaskCache::GetTokenMaskWithFirstCharacterCheck(
 
   XGRAMMAR_DCHECK(init_rule_id_ != -1 && grammar_->per_rule_fsms[init_rule_id_].has_value());
   auto [speculative_calculation, speculative_mask] = GetSpeculativeCalculation();
-  if (has_char_budget_rules_) {
+  const auto& initial_rule = grammar_->GetRule(init_rule_id_);
+  bool unbudgeted_dispatch_loop = initial_rule.max_chars < 0 && !HasEnteredCharBudget() &&
+      grammar_->GetGrammarExpr(initial_rule.body_expr_id).type ==
+          Grammar::Impl::GrammarExprType::kTagDispatch;
+  // The dispatch fast path proves the entire token stays on the ordinary
+  // text loop: no trigger or excluded string is crossed, so no child budget
+  // can be entered. A budget on this loop itself still disables it.
+  if (may_enter_char_budget_ && !unbudgeted_dispatch_loop) {
     speculative_calculation = false;
   }
 
@@ -807,7 +824,7 @@ AdaptiveTokenMask GrammarMatcherForTokenMaskCache::GetAdaptiveTokenMask(bool is_
   tmp_can_reach_end_prefix_or_stack_.push_back(false);
 
   // Try to get the crossing cache.
-  bool rule_level_cache_is_available = !has_char_budget_rules_ && rule_level_cache_.has_value() &&
+  bool rule_level_cache_is_available = !may_enter_char_budget_ && rule_level_cache_.has_value() &&
                                        grammar_->per_rule_fsm_hashes[init_rule_id_].has_value();
   std::optional<uint64_t> fsm_hash = std::nullopt;
   int32_t new_state_id = -1;
@@ -815,7 +832,10 @@ AdaptiveTokenMask GrammarMatcherForTokenMaskCache::GetAdaptiveTokenMask(bool is_
   int lookahead_id = grammar_->GetRule(initial_state_.rule_id).lookahead_assertion_id;
   bool is_exact_lookahead = grammar_->GetRule(initial_state_.rule_id).is_exact_lookahead;
   std::optional<uint64_t> lookahead_hash = std::nullopt;
-  if (rule_level_cache_is_available) {
+  bool exact_budget_cache = may_enter_char_budget_ && rule_level_cache_.has_value() &&
+                            grammar_->per_rule_fsm_hashes[init_rule_id_].has_value();
+  uint64_t exact_key = 0;
+  if (rule_level_cache_is_available || exact_budget_cache) {
     lookahead_hash = GrammarFSMHasher::HashSequence(grammar_, lookahead_id);
     const auto& original_to_new_id = grammar_->per_rule_fsm_new_state_ids[init_rule_id_];
     fsm_hash = grammar_->per_rule_fsm_hashes[init_rule_id_].value();
@@ -826,6 +846,18 @@ AdaptiveTokenMask GrammarMatcherForTokenMaskCache::GetAdaptiveTokenMask(bool is_
       }
     }
     XGRAMMAR_DCHECK(new_state_id != -1);
+    const auto& fsm = grammar_->per_rule_fsms[init_rule_id_].value();
+    if (exact_budget_cache) {
+      // Budget metadata is not part of the ordinary FSM hash. Pin the entire
+      // reachable rule definitions, lookahead and root role, and only reuse
+      // the complete mask; ordinary lookahead adaptation is not valid here.
+      exact_key = HashCombine(fsm_hash.value(), exact_budget_cache_key_, is_root_rule);
+      crossing_cache = rule_level_cache_->GetCache(
+          exact_key, new_state_id, fsm.GetNodeNum(), fsm.GetEdgeNum());
+      if (crossing_cache.has_value()) return crossing_cache.value();
+    }
+  }
+  if (rule_level_cache_is_available) {
     const auto& fsm = grammar_->per_rule_fsms[init_rule_id_].value();
     if (lookahead_hash.has_value()) {
       crossing_cache = rule_level_cache_->GetCache(
@@ -945,6 +977,11 @@ AdaptiveTokenMask GrammarMatcherForTokenMaskCache::GetAdaptiveTokenMask(bool is_
         );
       }
     }
+    if (exact_budget_cache) {
+      const auto& fsm = grammar_->per_rule_fsms[init_rule_id_].value();
+      rule_level_cache_->AddCache(
+          exact_key, new_state_id, fsm.GetNodeNum(), fsm.GetEdgeNum(), return_value);
+    }
     return return_value;
   } else {
     auto return_value = AdaptiveTokenMask(
@@ -1001,6 +1038,11 @@ AdaptiveTokenMask GrammarMatcherForTokenMaskCache::GetAdaptiveTokenMask(bool is_
             return_value
         );
       }
+    }
+    if (exact_budget_cache) {
+      const auto& fsm = grammar_->per_rule_fsms[init_rule_id_].value();
+      rule_level_cache_->AddCache(
+          exact_key, new_state_id, fsm.GetNodeNum(), fsm.GetEdgeNum(), return_value);
     }
     return return_value;
   }
@@ -1091,6 +1133,95 @@ static void CheckTokenIdsInVocab(const Grammar& grammar, int vocab_size) {
   }
 }
 
+static std::pair<std::vector<bool>, std::vector<uint64_t>> CharacterBudgetCacheKeys(
+    const Grammar& grammar
+) {
+  using Type = Grammar::Impl::GrammarExprType;
+  std::vector<std::vector<int32_t>> references(grammar->NumRules());
+  std::vector<bool> budget(grammar->NumRules(), false);
+  for (int32_t rule_id = 0; rule_id < grammar->NumRules(); ++rule_id) {
+    const auto& rule = grammar->GetRule(rule_id);
+    budget[rule_id] = rule.max_chars >= 0;
+    std::vector<int32_t> pending{rule.body_expr_id};
+    if (rule.lookahead_assertion_id >= 0) {
+      pending.push_back(rule.lookahead_assertion_id);
+    }
+    if (const auto* suffix = grammar->GetSuffixStopInfo(rule_id)) {
+      if (suffix->body_rule_id >= 0) references[rule_id].push_back(suffix->body_rule_id);
+      if (suffix->marker_rule_id >= 0) references[rule_id].push_back(suffix->marker_rule_id);
+    }
+    while (!pending.empty()) {
+      const auto expr = grammar->GetGrammarExpr(pending.back());
+      pending.pop_back();
+      switch (expr.type) {
+        case Type::kRuleRef:
+        case Type::kRepeat:
+          references[rule_id].push_back(expr[0]);
+          break;
+        case Type::kSequence:
+        case Type::kChoices:
+          pending.insert(pending.end(), expr.begin(), expr.end());
+          break;
+        case Type::kTagDispatch:
+          for (int32_t i = 0; i + 2 < expr.size(); i += 2) {
+            references[rule_id].push_back(expr[i + 1]);
+          }
+          break;
+        case Type::kTokenTagDispatch:
+          for (int32_t i = 0; i < expr[0]; ++i) {
+            references[rule_id].push_back(expr[2 + 2 * i]);
+          }
+          break;
+        default:
+          break;
+      }
+    }
+  }
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (int32_t rule_id = 0; rule_id < grammar->NumRules(); ++rule_id) {
+      if (budget[rule_id]) continue;
+      for (int32_t ref : references[rule_id]) {
+        if (budget[ref]) {
+          budget[rule_id] = true;
+          changed = true;
+          break;
+        }
+      }
+    }
+  }
+  GrammarPrinter printer(grammar);
+  std::vector<std::string> definitions;
+  for (int32_t rule_id = 0; rule_id < grammar->NumRules(); ++rule_id) {
+    definitions.push_back(printer.PrintRule(rule_id) +
+                          (grammar->GetRule(rule_id).is_exact_lookahead ? " exact" : " partial"));
+  }
+  std::vector<uint64_t> exact_keys(grammar->NumRules(), 0);
+  for (int32_t origin = 0; origin < grammar->NumRules(); ++origin) {
+    if (!budget[origin]) continue;
+    std::vector<bool> visited(grammar->NumRules(), false);
+    std::vector<int32_t> pending{origin};
+    std::vector<std::string> reachable_definitions;
+    while (!pending.empty()) {
+      int32_t rule_id = pending.back();
+      pending.pop_back();
+      if (visited[rule_id]) continue;
+      visited[rule_id] = true;
+      reachable_definitions.push_back(definitions[rule_id]);
+      pending.insert(pending.end(), references[rule_id].begin(), references[rule_id].end());
+    }
+    std::sort(reachable_definitions.begin(), reachable_definitions.end());
+    uint64_t key = std::hash<std::string>{}("exact-character-budget-mask-v1");
+    HashCombineBinary(key, std::hash<std::string>{}(grammar->GetRule(origin).name));
+    for (const auto& definition : reachable_definitions) {
+      HashCombineBinary(key, std::hash<std::string>{}(definition));
+    }
+    exact_keys[origin] = key;
+  }
+  return {std::move(budget), std::move(exact_keys)};
+}
+
 CompiledGrammar GrammarCompilerSub::MultiThreadCompileGrammar(Grammar grammar_unoptimized) {
   auto compiled_grammar_impl = std::make_shared<CompiledGrammar::Impl>();
   compiled_grammar_impl->grammar = GrammarOptimizer::Apply(grammar_unoptimized);
@@ -1122,13 +1253,17 @@ CompiledGrammar GrammarCompilerSub::MultiThreadCompileGrammar(Grammar grammar_un
     adaptive_token_mask_cache_mutex.emplace();
   }
 
+  const auto budget_cache = CharacterBudgetCacheKeys(compiled_grammar_impl->grammar);
+
   auto add_adaptive_token_mask = [&](const ParserState& state, bool is_root_rule) {
     auto grammar_matcher = GrammarMatcherForTokenMaskCache(
         compiled_grammar_impl->grammar,
         state,
         tag_dispatch_rule_id_to_second_slicing_bitset,
         tokenizer_info_,
-        rule_level_cache_
+        rule_level_cache_,
+        budget_cache.first[state.rule_id],
+        budget_cache.second[state.rule_id]
     );
     auto cur_adaptive_token_mask_cache = grammar_matcher.GetAdaptiveTokenMask(is_root_rule);
     if (max_threads_ > 1) {

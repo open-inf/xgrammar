@@ -358,6 +358,8 @@ void TokenizerInfo::Impl::BuildTokenIdToSortedVocabIndex() {
 
 void TokenizerInfo::Impl::BuildTokenCharData() {
   token_char_counts_.assign(sorted_decoded_vocab_.size(), 0);
+  tokens_by_char_count_.clear();
+  ordinary_token_mask_ = DynamicBitset(vocab_size_);
   int32_t max_chars = 0;
   for (int32_t index = 0; index < static_cast<int32_t>(sorted_decoded_vocab_.size()); ++index) {
     int32_t count = 0;
@@ -365,9 +367,12 @@ void TokenizerInfo::Impl::BuildTokenCharData() {
       count += (byte & 0xC0) != 0x80;
     }
     token_char_counts_[index] = count;
+    tokens_by_char_count_.emplace_back(count, index);
+    ordinary_token_mask_.Set(sorted_decoded_vocab_[index].first);
     max_chars = std::max(max_chars, count);
   }
   max_token_chars_ = max_chars;
+  std::sort(tokens_by_char_count_.begin(), tokens_by_char_count_.end());
 }
 
 const std::vector<int32_t>& TokenizerInfo::Impl::GetTokenCharCounts() const {

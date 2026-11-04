@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <optional>
+#include <unordered_set>
+#include "../support/thread_pool.h"
 #include <string>
 #include <variant>
 #include <vector>
@@ -281,6 +283,53 @@ class BatchGrammarMatcherObj : public ffi::Object {
 // ----- Registration: ObjectDef -----
 // Custom constructors are handled via lambda wrappers below; TVM-FFI uses refl::init<Args...>()
 // and we need to bridge FFI types to xgrammar types in those lambdas.
+
+// Both entry points use the same scalar parser operations and rollback path.
+template <typename Token, typename Words, typename Keeps>
+static void TraverseFilteredChain(
+    GrammarMatcher& matcher, const Token* tokens, DLTensor* masks, float* temps,
+    const int32_t* supplied, const Words& words, const Keeps& keeps, int64_t minimum,
+    const Words& min_words, const Keeps& min_keeps) {
+  const int64_t queries = masks->shape[0], width = masks->shape[1];
+  auto* bits = static_cast<int32_t*>(masks->data);
+            auto apply = [](int32_t* row, auto w, auto k) {
+              for (int64_t i = 0; i < static_cast<int64_t>(w.size()); ++i) {
+                row[w[i]] &= static_cast<int32_t>(k[i]);
+              }
+            };
+            auto clear = [bits, width, queries](int64_t start) {
+              std::fill(bits + start * width, bits + queries * width, 0);
+            };
+            int advanced = 0;
+            try {
+              for (int64_t query = 0; query < queries; ++query) {
+                if (matcher.IsTerminated()) { clear(query); break; }
+                auto* row = bits + query * width;
+                if (query == 0 && supplied) {
+                  std::copy_n(supplied, width, row);
+                } else {
+                  matcher.FillNextTokenBitmask(masks, query);
+                  if (!matcher.IsCompleted()) { apply(row, words, keeps); }
+                }
+                if (auto temperature = matcher.GetTemperature()) { temps[query] = *temperature; }
+                if (query < minimum) { apply(row, min_words, min_keeps); }
+                if (query + 1 < queries) {
+                  const int32_t token = tokens[query + 1];
+                  if (!(static_cast<uint32_t>(row[token / 32]) & (uint32_t{1} << (token % 32)))) {
+                    clear(query + 1); break;
+                  }
+                  if (!matcher.AcceptToken(token)) {
+                    TVM_FFI_THROW(RuntimeError) << "Speculative grammar mask disagrees with matcher";
+                  }
+                  ++advanced;
+                }
+              }
+            } catch (...) {
+              if (advanced) matcher.Rollback(advanced);
+              throw;
+            }
+            if (advanced) matcher.Rollback(advanced);
+}
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   using O = ffi::ObjectRef;
@@ -654,6 +703,162 @@ TVM_FFI_STATIC_INIT_BLOCK() {
           }
       )
       .def_static(
+          "batch_traverse_filtered_chains",
+          [](ffi::Array<O> matchers_ref, ffi::Array<int64_t> rows,
+             ffi::AnyView inputs_value, ffi::AnyView masks_value, ffi::AnyView temps_value,
+             ffi::Array<ffi::Any> supplied_values,
+             ffi::Array<ffi::Array<int64_t>> words, ffi::Array<ffi::Array<int64_t>> keeps,
+             ffi::Array<int64_t> minimum, ffi::Array<ffi::Array<int64_t>> min_words,
+             ffi::Array<ffi::Array<int64_t>> min_keeps, int64_t threads) {
+            const int64_t count = rows.size();
+            XGRAMMAR_CHECK(matchers_ref.size() == static_cast<size_t>(count) && supplied_values.size() == static_cast<size_t>(count)
+                && words.size() == static_cast<size_t>(count) && keeps.size() == static_cast<size_t>(count) && minimum.size() == static_cast<size_t>(count)
+                && min_words.size() == static_cast<size_t>(count) && min_keeps.size() == static_cast<size_t>(count));
+            XGRAMMAR_CHECK(threads >= 1 && threads <= 8);
+            if (!count) return;
+            auto tensor = [](ffi::AnyView value, int ndim, int code, int bits) {
+              auto* t = value.cast<DLTensor*>();
+              XGRAMMAR_CHECK(t && t->device.device_type == kDLCPU && t->ndim == ndim
+                  && t->dtype.code == code && t->dtype.lanes == 1 && t->byte_offset == 0);
+              XGRAMMAR_CHECK(bits ? t->dtype.bits == bits :
+                  (t->dtype.bits == 32 || t->dtype.bits == 64));
+              int64_t stride = 1;
+              for (int i = ndim - 1; i >= 0; --i) {
+                XGRAMMAR_CHECK(t->shape[i] > 0 && (!t->strides || t->strides[i] == stride));
+                stride *= t->shape[i];
+              }
+              XGRAMMAR_CHECK(t->data != nullptr);
+              return t;
+            };
+            auto* inputs = tensor(inputs_value, 2, kDLInt, 0);
+            auto* masks = tensor(masks_value, 3, kDLInt, 32);
+            auto* temperatures = tensor(temps_value, 2, kDLFloat, 32);
+            const int64_t batch = masks->shape[0], queries = masks->shape[1];
+            const int64_t width = masks->shape[2];
+            XGRAMMAR_CHECK(inputs->shape[0] == batch && inputs->shape[1] == queries
+                && temperatures->shape[0] == batch && temperatures->shape[1] == queries);
+            auto validate_words = [width](const auto& w, const auto& k) {
+              XGRAMMAR_CHECK(w.size() == k.size());
+              for (int64_t j = 0; j < static_cast<int64_t>(w.size()); ++j)
+                XGRAMMAR_CHECK(w[j] >= 0 && w[j] < width
+                    && k[j] >= INT32_MIN && k[j] <= INT32_MAX);
+            };
+            std::vector<GrammarMatcher> matchers;
+            std::vector<std::vector<int32_t>> supplied(count);
+            std::vector<std::exception_ptr> errors(count);
+            std::unordered_set<int64_t> destinations;
+            std::unordered_set<const void*> owners;
+            matchers.reserve(count);
+            bool parallel = count >= 8 && threads > 1;
+            // Validate the entire batch before borrowing any parser.
+            for (int64_t i = 0; i < count; ++i) {
+              auto* object = matchers_ref[i].as<GrammarMatcherObj>();
+              XGRAMMAR_CHECK(object && rows[i] >= 0 && rows[i] < batch
+                  && destinations.insert(rows[i]).second && minimum[i] >= 0);
+              auto matcher = object->value;
+              parallel &= owners.insert(matcher.ImplPtr()).second;
+              const auto rollback = matcher.GetMaxRollbackTokens();
+              XGRAMMAR_CHECK(rollback < 0 || rollback >= queries - 1);
+              matchers.push_back(std::move(matcher));
+              validate_words(words[i], keeps[i]);
+              validate_words(min_words[i], min_keeps[i]);
+              ffi::AnyView provided = supplied_values[i];
+              if (provided != nullptr) {
+                auto* value = tensor(provided, 1, kDLInt, 32);
+                XGRAMMAR_CHECK(value->shape[0] == width);
+                auto* data = static_cast<int32_t*>(value->data);
+                supplied[i].assign(data, data + width);
+              }
+              for (int64_t q = 1; q < queries; ++q) {
+                const int64_t offset = rows[i] * queries + q;
+                const int64_t token = inputs->dtype.bits == 32
+                    ? static_cast<int32_t*>(inputs->data)[offset]
+                    : static_cast<int64_t*>(inputs->data)[offset];
+                XGRAMMAR_CHECK(token >= 0 && token < width * 32 && token <= INT32_MAX);
+              }
+            }
+            auto run = [&](int64_t i) {
+              try {
+                const int64_t row = rows[i];
+                int64_t shape[] = {queries, width};
+                DLTensor view = *masks;
+                view.data = static_cast<int32_t*>(masks->data) + row * queries * width;
+                view.ndim = 2; view.shape = shape; view.strides = nullptr;
+                auto* temps = static_cast<float*>(temperatures->data) + row * queries;
+                auto* provided = supplied[i].empty() ? nullptr : supplied[i].data();
+                if (inputs->dtype.bits == 32) {
+                  TraverseFilteredChain(matchers[i],
+                      static_cast<int32_t*>(inputs->data) + row * queries,
+                      &view, temps, provided, words[i], keeps[i], minimum[i],
+                      min_words[i], min_keeps[i]);
+                } else {
+                  TraverseFilteredChain(matchers[i],
+                      static_cast<int64_t*>(inputs->data) + row * queries,
+                      &view, temps, provided, words[i], keeps[i], minimum[i],
+                      min_words[i], min_keeps[i]);
+                }
+              } catch (...) { errors[i] = std::current_exception(); }
+            };
+            if (parallel) {
+              static ThreadPool pool(8);
+              const int64_t chunks = std::min(threads, count);
+              std::vector<std::shared_future<void>> tasks;
+              tasks.reserve(chunks);
+              std::exception_ptr dispatch_error;
+              try {
+                for (int64_t chunk = 0; chunk < chunks; ++chunk)
+                  tasks.push_back(pool.Submit([&, chunk] {
+                    for (int64_t i = count * chunk / chunks;
+                         i < count * (chunk + 1) / chunks; ++i) run(i);
+                  }));
+              } catch (...) { dispatch_error = std::current_exception(); }
+              // Every submitted task rejoins before an error can escape.
+              for (auto& task : tasks) {
+                try { task.get(); }
+                catch (...) { if (!dispatch_error) dispatch_error = std::current_exception(); }
+              }
+              if (dispatch_error) std::rethrow_exception(dispatch_error);
+            } else {
+              for (int64_t i = 0; i < count; ++i) {
+                run(i);
+                if (errors[i]) break;
+              }
+            }
+            for (const auto& error : errors) if (error) std::rethrow_exception(error);
+          }
+      )
+      .def_static(
+          "batch_accept_token_blocks",
+          [](ffi::Array<O> matchers_ref, ffi::Array<int64_t> tokens,
+             ffi::Array<int64_t> lengths) -> int64_t {
+            // Commit in row/token order, with the same AcceptToken semantics as
+            // scalar commits. Return the accepted prefix on failure; later rows
+            // remain untouched. A scalar result avoids one FFI read per token.
+            XGRAMMAR_CHECK(matchers_ref.size() == lengths.size());
+            int64_t total = 0;
+            for (int64_t i = 0; i < static_cast<int64_t>(lengths.size()); ++i) {
+              XGRAMMAR_CHECK(lengths[i] >= 0 && lengths[i] <= static_cast<int64_t>(tokens.size()) - total);
+              XGRAMMAR_CHECK(matchers_ref[i].as<GrammarMatcherObj>() != nullptr);
+              total += lengths[i];
+            }
+            XGRAMMAR_CHECK(total == static_cast<int64_t>(tokens.size()));
+            for (int64_t token : tokens) {
+              XGRAMMAR_CHECK(token >= INT32_MIN && token <= INT32_MAX);
+            }
+            int64_t accepted = 0;
+            for (int64_t i = 0; i < static_cast<int64_t>(lengths.size()); ++i) {
+              auto matcher = matchers_ref[i].as<GrammarMatcherObj>()->value;
+              for (int64_t j = 0; j < lengths[i]; ++j) {
+                if (!matcher.AcceptToken(static_cast<int32_t>(tokens[accepted]))) {
+                  return accepted;
+                }
+                ++accepted;
+              }
+            }
+            return accepted;
+          }
+      )
+      .def_static(
           "batch_accept_token",
           [](ffi::Array<O> matchers_ref, ffi::Array<int64_t> token_ids, bool debug_print) {
             std::vector<GrammarMatcher> matchers;
@@ -717,6 +922,52 @@ TVM_FFI_STATIC_INIT_BLOCK() {
           [](GrammarMatcherObj* o, ffi::AnyView token_bitmask, int64_t index, bool debug_print) {
             DLTensor* dlt = token_bitmask.cast<DLTensor*>();
             return o->value.FillNextTokenBitmask(dlt, static_cast<int>(index), debug_print);
+          }
+      )
+      .def(
+          "traverse_filtered_chain",
+          [](GrammarMatcherObj* o, ffi::AnyView inputs_value, ffi::AnyView masks_value,
+             ffi::AnyView temperatures_value, ffi::AnyView supplied_value,
+             ffi::Array<int64_t> words, ffi::Array<int64_t> keeps, int64_t minimum,
+             ffi::Array<int64_t> min_words, ffi::Array<int64_t> min_keeps) {
+            auto tensor = [](ffi::AnyView value, int ndim, int code, int bits) {
+              auto* t = value.cast<DLTensor*>();
+              XGRAMMAR_CHECK(t && t->device.device_type == kDLCPU && t->ndim == ndim
+                             && t->dtype.code == code && t->dtype.bits == bits
+                             && t->dtype.lanes == 1 && t->byte_offset == 0);
+              int64_t stride = 1;
+              for (int i = ndim - 1; i >= 0; --i) {
+                XGRAMMAR_CHECK(t->shape[i] > 0 && (!t->strides || t->strides[i] == stride));
+                stride *= t->shape[i];
+              }
+              XGRAMMAR_CHECK(t->data != nullptr);
+              return t;
+            };
+            auto* inputs = tensor(inputs_value, 1, kDLInt, 64);
+            auto* masks = tensor(masks_value, 2, kDLInt, 32);
+            auto* temperatures = tensor(temperatures_value, 1, kDLFloat, 32);
+            const int64_t queries = inputs->shape[0], width = masks->shape[1];
+            XGRAMMAR_CHECK(masks->shape[0] == queries && temperatures->shape[0] == queries);
+            const int64_t* tokens = static_cast<int64_t*>(inputs->data);
+            auto* temps = static_cast<float*>(temperatures->data);
+            DLTensor* supplied = supplied_value == nullptr ? nullptr
+                : tensor(supplied_value, 1, kDLInt, 32);
+            XGRAMMAR_CHECK(!supplied || supplied->shape[0] == width);
+            auto validate_words = [width](auto w, auto k) {
+              XGRAMMAR_CHECK(w.size() == k.size());
+              for (int64_t i = 0; i < static_cast<int64_t>(w.size()); ++i) {
+                XGRAMMAR_CHECK(w[i] >= 0 && w[i] < width
+                               && k[i] >= INT32_MIN && k[i] <= INT32_MAX);
+              }
+            };
+            validate_words(words, keeps); validate_words(min_words, min_keeps);
+            for (int64_t i = 1; i < queries; ++i) {
+              XGRAMMAR_CHECK(tokens[i] >= 0 && tokens[i] < width * 32
+                             && tokens[i] <= INT32_MAX);
+            }
+            TraverseFilteredChain(o->value, tokens, masks, temps,
+                supplied ? static_cast<int32_t*>(supplied->data) : nullptr,
+                words, keeps, minimum, min_words, min_keeps);
           }
       )
       .def(

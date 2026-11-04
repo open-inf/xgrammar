@@ -481,6 +481,17 @@ class GrammarMatcher::Impl : public EarleyParser {
         terminate_without_stop_token_(terminate_without_stop_token),
         default_temperature_(default_temperature),
         tmp_accepted_bitset_(tokenizer_info_.GetVocabSize()) {
+    for (int32_t rule = 0; rule < grammar_->NumRules(); ++rule) {
+      has_temperature_rules_ |= grammar_->GetRule(rule).temperature.has_value();
+    }
+    for (int32_t expr_id = 0; expr_id < grammar_->NumGrammarExprs(); ++expr_id) {
+      auto type = grammar_->GetGrammarExpr(expr_id).type;
+      if (type == GrammarExprType::kToken || type == GrammarExprType::kExcludeToken ||
+          type == GrammarExprType::kTokenTagDispatch) {
+        has_atomic_token_rules_ = true;
+        break;
+      }
+    }
     if (override_stop_tokens.has_value()) {
       XGRAMMAR_CHECK(!override_stop_tokens->empty())
           << "The override_stop_tokens should not be empty";
@@ -631,6 +642,10 @@ class GrammarMatcher::Impl : public EarleyParser {
   void FillBitmaskForCharBudgetBoundary(
       const AdaptiveTokenMask& adaptive_token_mask, int32_t remaining_chars
   );
+
+  // Byte-only grammars cannot accept a rejected token through an atomic edge.
+  bool has_atomic_token_rules_ = false;
+  bool has_temperature_rules_ = false;
 
   bool AdvanceWithCharacterBudget(uint8_t byte, bool debug_print = false);
 
@@ -1191,6 +1206,9 @@ bool GrammarMatcher::Impl::AdvanceAtomicTokenWithCharacterBudget(
 }
 
 std::optional<float> GrammarMatcher::Impl::GetTemperature() const {
+  if (!has_temperature_rules_) {
+    return default_temperature_;
+  }
   std::optional<float> syntax_temperature = std::nullopt;
   bool has_temperature_conflict = false;
   for (const auto& state : GetLatestScanableStates()) {
@@ -1313,7 +1331,7 @@ bool GrammarMatcher::Impl::AcceptToken(int32_t token_id, bool debug_print) {
 
   const auto& token = tokenizer_info_.GetDecodedVocab()[token_id];
   int32_t token_char_count = 0;
-  if (has_char_budget_rules_) {
+  if (has_char_budget_rules_ && has_atomic_token_rules_) {
     for (uint8_t byte : token) {
       token_char_count += StartsUTF8Codepoint(byte);
     }
@@ -1324,7 +1342,12 @@ bool GrammarMatcher::Impl::AcceptToken(int32_t token_id, bool debug_print) {
   std::vector<std::pair<int32_t, ParserState>> completable_before_token;
   std::vector<CaptureEvent> capture_row_before_token;
   bool completed_before_token = false;
-  if (has_char_budget_rules_) {
+  bool save_before_token = has_char_budget_rules_ &&
+      (has_atomic_token_rules_ || std::any_of(
+          scanable_state_history_[scanable_state_history_.size() - 1].begin(),
+          scanable_state_history_[scanable_state_history_.size() - 1].end(),
+          [&](const ParserState& state) { return IsCharExpiredState(state); }));
+  if (save_before_token) {
     states_before_token = GetLatestScanableStates();
     auto completable_row_before_token = rule_id_to_completable_states_.Back();
     completable_before_token.assign(
@@ -1335,7 +1358,7 @@ bool GrammarMatcher::Impl::AcceptToken(int32_t token_id, bool debug_print) {
     completed_before_token = is_completed_.back();
   }
   auto restore_row_before_token = [&]() {
-    if (!has_char_budget_rules_) {
+    if (!save_before_token) {
       return;
     }
     scanable_state_history_.PopBack(1);
@@ -1354,10 +1377,10 @@ bool GrammarMatcher::Impl::AcceptToken(int32_t token_id, bool debug_print) {
   std::vector<std::pair<int32_t, ParserState>> atomic_completable;
   std::vector<CaptureEvent> atomic_capture_row;
   bool atomic_completed = false;
-  bool atomic_success =
-      has_char_budget_rules_
+  bool atomic_success = has_atomic_token_rules_ &&
+      (has_char_budget_rules_
           ? AdvanceAtomicTokenWithCharacterBudget(token_id, token_char_count, debug_print)
-          : AdvanceAtomicToken(token_id, debug_print);
+          : AdvanceAtomicToken(token_id, debug_print));
   if (atomic_success) {
     atomic_states = GetLatestScanableStates();
     auto row = rule_id_to_completable_states_.Back();
@@ -1740,39 +1763,38 @@ void GrammarMatcher::Impl::FillBitmaskForCharBudgetBoundary(
       }
       break;
     case StoreType::kAcceptedBitset:
-      for (int32_t index = 0; index < static_cast<int32_t>(vocab.size()); ++index) {
-        int32_t token_id = vocab[index].first;
-        if (!adaptive_token_mask.accepted_bitset[token_id]) {
-          continue;
-        }
-        if (token_char_counts[index] <= remaining_chars) {
-          tmp_accepted_bitset_.Set(token_id, true);
-        } else {
-          tokens_to_check.push_back(index);
-        }
-      }
-      break;
     case StoreType::kRejected: {
-      std::vector<int32_t> blocked = adaptive_token_mask.rejected_indices;
-      blocked.insert(
-          blocked.end(),
-          adaptive_token_mask.uncertain_indices.begin(),
-          adaptive_token_mask.uncertain_indices.end()
-      );
-      std::sort(blocked.begin(), blocked.end());
-      for (int32_t index = 0; index < static_cast<int32_t>(vocab.size()); ++index) {
-        if (token_char_counts[index] <= remaining_chars) {
-          if (!std::binary_search(blocked.begin(), blocked.end(), index)) {
-            tmp_accepted_bitset_.Set(vocab[index].first, true);
-          }
-        } else if (!std::binary_search(
-                       adaptive_token_mask.rejected_indices.begin(),
-                       adaptive_token_mask.rejected_indices.end(),
-                       index
-                   )) {
-          tokens_to_check.push_back(index);
+      // Start from the cached ordinary mask, then remove only blocked and
+      // over-budget tokens. Most tokens fit even near a character boundary;
+      // scanning the entire vocabulary here makes every bounded raw string
+      // pay for its largest tokenizer entry on every decode step.
+      DynamicBitset accepted = adaptive_token_mask.store_type == StoreType::kAcceptedBitset
+                                   ? adaptive_token_mask.accepted_bitset
+                                   : tokenizer_info_.ImplPtr()->GetOrdinaryTokenMask();
+      if (adaptive_token_mask.store_type == StoreType::kRejected) {
+        for (int32_t i : adaptive_token_mask.rejected_indices) {
+          accepted.Reset(vocab[i].first);
+        }
+        for (int32_t i : adaptive_token_mask.uncertain_indices) {
+          accepted.Reset(vocab[i].first);
         }
       }
+      const auto& by_length = tokenizer_info_.ImplPtr()->GetTokensByCharCount();
+      auto first_long = std::upper_bound(
+          by_length.begin(), by_length.end(),
+          std::make_pair(remaining_chars, std::numeric_limits<int32_t>::max()));
+      for (auto it = first_long; it != by_length.end(); ++it) {
+        int32_t i = it->second;
+        bool check = adaptive_token_mask.store_type == StoreType::kAcceptedBitset
+                         ? adaptive_token_mask.accepted_bitset[vocab[i].first]
+                         : !std::binary_search(adaptive_token_mask.rejected_indices.begin(),
+                                               adaptive_token_mask.rejected_indices.end(), i);
+        accepted.Reset(vocab[i].first);
+        if (check) {
+          tokens_to_check.push_back(i);
+        }
+      }
+      tmp_accepted_bitset_ |= accepted;
       break;
     }
   }
@@ -1798,6 +1820,7 @@ void GrammarMatcher::Impl::FillBitmaskForCharBudgetBoundary(
   for (int32_t index : tokens_to_check) {
     const std::string& token = vocab[index].second;
     int32_t common_prefix_length = 0;
+    bool shared_rejection = false;
     if (previous_index >= 0) {
       common_prefix_length = std::mismatch(
                                  vocab[previous_index].second.begin(),
@@ -1807,6 +1830,10 @@ void GrammarMatcher::Impl::FillBitmaskForCharBudgetBoundary(
                              )
                                  .first -
                              vocab[previous_index].second.begin();
+      // A byte rejected at this exact parser position cannot be repaired by
+      // a longer token sharing that prefix. Atomic alternatives are checked
+      // separately below; retain them even when byte traversal is pruned.
+      shared_rejection = common_prefix_length > previous_matched_size;
       common_prefix_length = std::min(common_prefix_length, previous_matched_size);
     }
     PopLastStates(
@@ -1814,9 +1841,9 @@ void GrammarMatcher::Impl::FillBitmaskForCharBudgetBoundary(
     );
     temporary_input_bytes_.resize(common_prefix_length);
 
-    bool accepted = !token.empty();
+    bool accepted = !token.empty() && !shared_rejection;
     int32_t matched_size = common_prefix_length;
-    for (; matched_size < static_cast<int32_t>(token.size()); ++matched_size) {
+    for (; accepted && matched_size < static_cast<int32_t>(token.size()); ++matched_size) {
       if (!AdvanceWithCharacterBudget(static_cast<uint8_t>(token[matched_size]))) {
         accepted = false;
         break;
@@ -1834,6 +1861,9 @@ void GrammarMatcher::Impl::FillBitmaskForCharBudgetBoundary(
   PopLastStates(scanable_state_history_.size() - initial_state_history_size + 1);
 
   for (int32_t index : byte_rejected_tokens) {
+    if (!has_atomic_token_rules_) {
+      break;
+    }
     PushStatesToCheck(all_latest_states, all_latest_completed);
     temporary_input_start_row_ = scanable_state_history_.size() - 1;
     temporary_input_bytes_.clear();
@@ -1918,11 +1948,7 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
     tmp_rejected_indices_delta_.clear();
 
     // Examine only the current one ParserState
-    std::optional<Impl> atomic_trial_base;
-    if (has_char_budget_rules_ && !adaptive_token_mask.uncertain_indices.empty()) {
-      atomic_trial_base.emplace(*this);
-      atomic_trial_base->capture_recording_ = false;
-    }
+    std::vector<int32_t> atomic_pending;
     PushOneStateToCheck(state);
     bool track_temporary_input = has_char_budget_rules_ && has_budget_marker_rules_;
     int32_t saved_temporary_input_start_row = -1;
@@ -1949,7 +1975,7 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
 
       // Check if the current token is in the rejected range. i.e. check if the current token
       // is on the subtree of the rejected token.
-      if (cur_token_idx < last_rejected_uncertain_range) {
+      if (!has_char_budget_rules_ && cur_token_idx < last_rejected_uncertain_range) {
         if (adaptive_token_mask.store_type == StoreType::kRejected) {
           tmp_rejected_indices_delta_.push_back(cur_token_idx);
         }
@@ -1997,20 +2023,8 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
         }
       }
 
-      if (!accepted && has_char_budget_rules_) {
-        int32_t token_char_count = 0;
-        for (uint8_t byte : cur_token) {
-          token_char_count += StartsUTF8Codepoint(byte);
-        }
-        XGRAMMAR_DCHECK(atomic_trial_base.has_value());
-        Impl atomic_trial(atomic_trial_base.value());
-        atomic_trial.PushOneStateToCheck(state);
-        accepted = atomic_trial.AdvanceAtomicTokenWithCharacterBudget(
-            sorted_decoded_vocab[cur_token_idx].first, token_char_count
-        );
-        if (accepted) {
-          last_rejected_uncertain_range = cur_token_idx + 1;
-        }
+      if (!accepted && has_char_budget_rules_ && has_atomic_token_rules_) {
+        atomic_pending.push_back(cur_token_idx);
       }
 
       // Step 2.3. Push the result to the delta list.
@@ -2020,7 +2034,7 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
           tmp_accepted_bitset_.Set(sorted_decoded_vocab[cur_token_idx].first, true);
         }
       } else {
-        if (!accepted) {
+        if (!accepted && (!has_char_budget_rules_ || !has_atomic_token_rules_)) {
           tmp_rejected_indices_delta_.push_back(cur_token_idx);
         }
       }
@@ -2033,6 +2047,24 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
       temporary_input_start_row_ = saved_temporary_input_start_row;
       temporary_input_bytes_ = std::move(saved_temporary_input_bytes);
     }
+    // Check atomic alternatives only after restoring the owned parser to its
+    // entry state. Temporary rows are rolled back exactly as in the character
+    // boundary path, avoiding a full parsing-history copy for every mask fill.
+    bool was_capture_recording = capture_recording_;
+    capture_recording_ = false;
+    for (int32_t i : atomic_pending) {
+      PushOneStateToCheck(state);
+      bool accepted = AdvanceAtomicTokenWithCharacterBudget(
+          sorted_decoded_vocab[i].first, tokenizer_info_.ImplPtr()->GetTokenCharCounts()[i]);
+      if (accepted) {
+        tmp_accepted_bitset_.Set(sorted_decoded_vocab[i].first, true);
+        PopLastStates(1);
+      } else if (adaptive_token_mask.store_type == StoreType::kRejected) {
+        tmp_rejected_indices_delta_.push_back(i);
+      }
+      PopLastStates(1);
+    }
+    capture_recording_ = was_capture_recording;
     // Step 3. Update the accepted_indices or rejected_indices
     if (adaptive_token_mask.store_type == StoreType::kRejected) {
       // rejected_indices = Intersect(

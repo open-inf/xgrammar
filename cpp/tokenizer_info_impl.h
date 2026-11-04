@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "support/reflection.h"
+#include "support/dynamic_bitset.h"
 #include "xgrammar/tokenizer_info.h"
 
 namespace xgrammar {
@@ -42,6 +43,10 @@ class TokenizerInfo::Impl {
   }
   const std::vector<int32_t>& GetTokenCharCounts() const;
   int32_t GetMaxTokenChars() const;
+  const std::vector<std::pair<int32_t, int32_t>>& GetTokensByCharCount() const {
+    return tokens_by_char_count_;
+  }
+  const DynamicBitset& GetOrdinaryTokenMask() const { return ordinary_token_mask_; }
   void BuildTokenIdToSortedVocabIndex();
   void BuildTokenCharData();
 
@@ -94,6 +99,8 @@ class TokenizerInfo::Impl {
   /*! \brief Unicode codepoint counts for the sorted decoded vocabulary. */
   int32_t max_token_chars_ = 0;
   std::vector<int32_t> token_char_counts_;
+  std::vector<std::pair<int32_t, int32_t>> tokens_by_char_count_;
+  DynamicBitset ordinary_token_mask_;
 
   /*!
    * \brief The tokens used to detect stop tokens from the vocabulary.
