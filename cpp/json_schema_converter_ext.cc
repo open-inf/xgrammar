@@ -26,6 +26,35 @@ namespace xgrammar {
 
 namespace {
 
+// Whitespace patterns can keep consuming later XML fields. Avoid expanding
+// those expressions into Earley rules, while preserving RegexToEBNF's NBSP
+// whitespace semantics. Keep other patterns on their current compile path;
+// only GLM raw whitespace patterns are covered by this optimization.
+std::optional<std::string> GLMWhitespacePatternForFSM(const std::string& pattern) {
+  std::string result;
+  bool changed = false;
+  bool in_class = false;
+  for (size_t index = 0; index < pattern.size(); ++index) {
+    char character = pattern[index];
+    if (character == '\\' && index + 1 < pattern.size()) {
+      char escaped = pattern[++index];
+      if (escaped == 's' || escaped == 'S') {
+        if (in_class) return std::nullopt;
+        result += escaped == 's' ? R"([\f\n\r\t\v \xa0])" : R"([^\f\n\r\t\v \xa0])";
+        changed = true;
+      } else {
+        result += '\\';
+        result += escaped;
+      }
+    } else {
+      if (character == '[') in_class = true;
+      if (character == ']') in_class = false;
+      result += character;
+    }
+  }
+  return changed ? std::optional<std::string>(std::move(result)) : std::nullopt;
+}
+
 constexpr std::array<std::pair<TCodepoint, const char*>, 4> kCohereKeyEntities = {
     std::pair<TCodepoint, const char*>{'&', "&amp;"},
     std::pair<TCodepoint, const char*>{'<', "&lt;"},
@@ -623,6 +652,11 @@ int32_t XMLToolCallingConverter::GenerateString(
       }
     }
     if (spec.pattern.has_value()) {
+      if (json_format_ == JSONFormat::kGlmXML) {
+        if (auto pattern = GLMWhitespacePatternForFSM(*spec.pattern)) {
+          return RegexExpression(*pattern, false);
+        }
+      }
       return RegexExpression(*spec.pattern, false, /*force_cfg_expansion=*/true);
     }
     return Repeat(
