@@ -659,6 +659,22 @@ int32_t XMLToolCallingConverter::GenerateString(
       }
       return RegexExpression(*spec.pattern, false, /*force_cfg_expansion=*/true);
     }
+    if (json_format_ == JSONFormat::kGlmXML && spec.min_length > 0 && spec.max_length == -1) {
+      // An unbounded raw string with a minimum otherwise expands into Earley
+      // prefix rules whose alternatives remain live during later arguments.
+      // Keep modest minima below the regex builder's counted-repeat threshold
+      // per atom, so token masks can be cached for each finite prefix state.
+      // Larger minima retain a compact counter rather than an unbounded FSM.
+      std::string prefix;
+      if (spec.min_length <= 4096) {
+        for (int remaining = spec.min_length; remaining > 0; remaining -= 128) {
+          prefix += "[\\s\\S]{" + std::to_string(std::min(remaining, 128)) + "}";
+        }
+      } else {
+        prefix = "[\\s\\S]{" + std::to_string(spec.min_length) + "}";
+      }
+      return RegexExpression(prefix + "[\\s\\S]*", false);
+    }
     return Repeat(
         rule_name + "_characters",
         builder_.AddCharacterClass({{0, 0x10ffff}}),
