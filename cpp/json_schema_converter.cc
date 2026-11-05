@@ -838,6 +838,18 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::Parse(
   }
 
   const auto& schema_obj = schema.get<picojson::object>();
+  // An empty schema and boolean true accept every instance, so their negation
+  // is unsatisfiable. Do not silently turn a never alternative into AnySpec.
+  // Preserve the existing $ref precedence (including draft-07 sibling handling).
+  auto not_it = schema_obj.find("not");
+  if (!schema_obj.count("$ref") && not_it != schema_obj.end() &&
+      ((not_it->second.is<bool>() && not_it->second.get<bool>()) ||
+       (not_it->second.is<picojson::object>() &&
+        not_it->second.get<picojson::object>().empty()))) {
+    return ResultErr<SchemaError>(
+        SchemaErrorType::kUnsatisfiableSchema, "Negated universal schema cannot accept any value"
+    );
+  }
   WarnUnsupportedKeywords(
       schema_obj, {"not", "if", "then", "else", "dependentRequired", "dependentSchemas"}
   );
@@ -1629,10 +1641,19 @@ Result<AnyOfSpec, SchemaError> SchemaParser::ParseAnyOf(
   }
   int idx = 0;
   for (const auto& option : schema.at(keyword).get<picojson::array>()) {
-    auto option_result = Parse(option, "case_" + std::to_string(idx));
-    if (option_result.IsErr()) return ResultErr(std::move(option_result).UnwrapErr());
+    auto option_result = Parse(option, "case_" + std::to_string(idx++));
+    if (option_result.IsErr()) {
+      // A union is unaffected by alternatives that can never match. Other
+      // errors still propagate; invalid/unsupported alternatives aren't false.
+      if (option_result.ErrRef().Type() == SchemaErrorType::kUnsatisfiableSchema) continue;
+      return ResultErr(std::move(option_result).UnwrapErr());
+    }
     spec.options.push_back(std::move(option_result).Unwrap());
-    ++idx;
+  }
+  if (spec.options.empty()) {
+    return ResultErr<SchemaError>(
+        SchemaErrorType::kUnsatisfiableSchema, keyword + " has no satisfiable alternatives"
+    );
   }
   return ResultOk(std::move(spec));
 }
@@ -1649,14 +1670,22 @@ Result<OneOfSpec, SchemaError> SchemaParser::ParseOneOf(const picojson::object& 
   }
 
   int idx = 0;
+  picojson::array satisfiable_options;
   for (const auto& option : options) {
-    auto option_result = Parse(option, "case_" + std::to_string(idx));
-    if (option_result.IsErr()) return ResultErr(std::move(option_result).UnwrapErr());
+    auto option_result = Parse(option, "case_" + std::to_string(idx++));
+    if (option_result.IsErr()) {
+      if (option_result.ErrRef().Type() == SchemaErrorType::kUnsatisfiableSchema) continue;
+      return ResultErr(std::move(option_result).UnwrapErr());
+    }
     spec.options.push_back(std::move(option_result).Unwrap());
-    ++idx;
+    satisfiable_options.push_back(option);
   }
-
-  if (!TryProvePairwiseDisjointOneOf(options)) {
+  if (spec.options.empty()) {
+    return ResultErr<SchemaError>(
+        SchemaErrorType::kUnsatisfiableSchema, "oneOf has no satisfiable alternatives"
+    );
+  }
+  if (!TryProvePairwiseDisjointOneOf(satisfiable_options)) {
     return ResultErr<SchemaError>(SchemaErrorType::kUnsupportedSchema, kUnsupportedOneOfMessage);
   }
 
